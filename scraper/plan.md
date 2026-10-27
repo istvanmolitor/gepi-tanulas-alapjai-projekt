@@ -12,6 +12,18 @@ projekt nem válik egyetlen honlap HTML-struktúrájától függővé, és könn
 bővíthető újabb hirdetési oldalakkal, ha az ingatlan.com önmagában nem
 elegendő (mennyiség, lefedettség, vagy blokkolás miatt).
 
+**Hatókör-elhatárolás (fontos):** a scraper **kizárólag** a következőkért
+felel: hirdetés-linkek felderítése és **regisztrálása** (nyilvántartásba
+vétele), a letöltések **ütemezése**, valamint a hirdetés-oldalak nyers
+**HTML-jének letöltése és nyilvántartása** (melyik link mikor és milyen
+állapotban lett letöltve). A scraper **nem** parse-olja ki az ingatlan
+jellemzőit (ár, méret, szobaszám stb.) a HTML-ből, és nem állít elő
+strukturált/CSV adatot — ez a `preprocessing` fázis feladata, lásd
+`preprocessing/plan.md`. Ez a szétválasztás azért fontos, mert ha a
+mezőkinyerő logika hibás vagy változik, nem kell újra letölteni semmit:
+elég a már letöltött, nyilvántartott HTML-eken újrafuttatni a
+preprocessing lépést.
+
 ## 1. Cél és hatókör
 
 - **Architektúra:** egy közös "core" (letöltés, retry, mentés, dedup,
@@ -58,16 +70,25 @@ elegendő (mennyiség, lefedettség, vagy blokkolás miatt).
 A keretrendszer két rétegre bomlik:
 
 - **Core (forrásfüggetlen):** HTTP lekérés + retry/backoff, rate limiting,
-  nyers válasz mentése, deduplikáció, egységes séma validálása, feldolgozott
-  adat mentése, futás-riport/logolás, pipeline-vezérlés (melyik forrást mikor
-  futtatjuk). Ez a réteg semmit nem tud az ingatlan.com-ról vagy bármely
-  konkrét honlapról.
+  nyers HTML mentése, link-nyilvántartás vezetése és deduplikáció (4. pont),
+  letöltés-ütemezés (melyik linket mikor töltjük le/töltjük le újra),
+  futás-riport/logolás, pipeline-vezérlés (melyik forrást mikor futtatjuk),
+  valamint a forrásonkénti adat **zip-be exportálása és zip-ből importálása**
+  (lásd 4.1 pont). Ez a réteg semmit nem tud az ingatlan.com-ról vagy
+  bármely konkrét honlapról, és nem nyúl a hirdetés tartalmi mezőihez (ár,
+  méret stb.) — azokat nem ismeri, csak a HTML-t tölti le és tartja
+  nyilván.
 - **Site adapter (forrásspecifikus):** minden bevont honlaphoz egy kis modul,
-  amely egy közös interfészt implementál, tipikusan két függvényt/metódust:
+  amely egy közös interfészt implementál, alapvetően egy függvénnyel/
+  metódussal:
   1. `list_listing_urls(...)` — lista/keresési oldalak bejárása, lapozás
-     kezelése, hirdetés-linkek/ID-k visszaadása.
-  2. `parse_listing(html_or_response) -> record` — egy hirdetés oldal
-     feldolgozása az egységes (4. pontban leírt) sémára.
+     kezelése, hirdetés-linkek/ID-k visszaadása (ezek regisztrálásra kerülnek
+     a nyilvántartásban, lásd 4. pont).
+
+  A hirdetés-oldal HTML-jének letöltése már forrásfüggetlen, core-szintű
+  feladat (a regisztrált linkek alapján) — nincs szükség adapter-szintű
+  "parse_listing" lépésre, mert a scraper nem nyeri ki a mezőket, csak
+  letölti és elmenti a HTML-t.
 
   Az adapter dönt arról is, hogy az adott oldalhoz `requests`/`httpx` +
   `BeautifulSoup` elég (statikus HTML), vagy `Playwright`/`Selenium` szükséges
@@ -82,15 +103,19 @@ logika módosítását, csak egy új adapter megírását jelentse.
 1. **Lista oldalak bejárása** (keresési/szűrési URL-ek lapozással) →
    hirdetés-azonosítók/linkek kigyűjtése — az adapter végzi, forrásspecifikus
    logikával.
-2. **Részletes hirdetés oldalak lekérése** az összegyűjtött linkekről →
-   mezők kiparse-olása — ugyancsak adapter-szintű feladat, de a core
-   HTTP/retry rétegét használja.
-3. **Normalizálás:** az adapter kimenete a közös sémára illeszkedik, plusz
-   egy `forrás` mezőre (pl. `"ingatlan.com"`), hogy a végső, összesített
-   adatkészletben mindig visszakereshető legyen, melyik rekord honnan jött.
-4. **Mentés** nyers (raw HTML, visszakereshetőség/debug miatt, forrásonként
-   külön mappában) és feldolgozott (strukturált, pl. CSV/Parquet/SQLite,
-   forrásonként és/vagy összesítve) formában is.
+2. **Linkek regisztrálása:** az összegyűjtött linkek bekerülnek a
+   nyilvántartásba (4. pont sémája szerint) `felfedezve` állapottal, ha még
+   nem szerepelnek benne (dedup `(forrás, hirdetés ID)` alapján).
+3. **Letöltés ütemezése:** a nyilvántartásból a letöltendő linkek
+   kiválasztása (még nem letöltött, vagy frissítésre esedékes), rate
+   limit/politeness-szabályok szerint sorba állítva — core-szintű, nem
+   forrásspecifikus logika.
+4. **HTML letöltése** az ütemezett linkekhez — a core HTTP/retry rétegét
+   használja, forrásfüggetlen (nincs mezőkinyerés, csak nyers válasz).
+5. **Mentés és nyilvántartás-frissítés:** a nyers HTML forrásonként külön
+   mappába kerül (visszakereshetőség/debug miatt), a nyilvántartásban pedig
+   frissül az állapot (`letöltve`/`hiba`), a letöltés dátuma, a mentett
+   fájl elérési útja és a HTTP státuszkód.
 
 ### 3.3 Inkrementális gyűjtés
 - Hirdetés-azonosító (ID) alapú deduplikáció **forráson belül**, hogy
@@ -101,32 +126,63 @@ logika módosítását, csak egy új adapter megírását jelentse.
   mely hirdetések tűntek el (eladva/törölve) — ez később hasznos lehet az
   elemzésnél is (pl. mennyi idő alatt kelt el egy hirdetés, ha ez a cél).
 
-## 4. Tervezett adatséma (hirdetés-szintű rekord, forrásfüggetlen)
+## 4. Tervezett nyilvántartási séma (link-szintű rekord, forrásfüggetlen)
 
-Ez a séma a **core/normalizált** réteg kimenete — minden adapternek ide kell
-leképeznie a saját forrása mezőit, akkor is, ha az eredeti honlapon más
-elnevezéssel/formátummal szerepelnek.
+Ez **nem** az ingatlan-adat sémája (azt lásd `preprocessing/plan.md`), hanem
+a scraper saját link-nyilvántartása: minden felfedezett hirdetés-linkhez egy
+sor, ami a letöltés állapotát követi.
+
+**Tárolási forma:** a nyilvántartás **forrásonként külön CSV fájlban**
+(nem közös, nem SQLite) kerül tárolásra, a forrás saját mappájában, a
+letöltött HTML-ekkel együtt (lásd 6. pont mappastruktúrája) — így egy
+forrás teljes adata (nyilvántartás + HTML-ek) egyetlen mappába zárva,
+önállóan kezelhető (pl. zip-elhető, lásd 4.1 pont).
 
 | Mező | Megjegyzés |
 |---|---|
-| forrás | melyik honlapról származik a rekord (pl. `ingatlan.com`) |
+| forrás | melyik honlapról származik a link (pl. `ingatlan.com`) |
 | hirdetés ID | forráson belül egyedi azonosító, deduplikációhoz |
-| ár (Ft) | cél változó |
-| alapterület (m²) | |
-| szobaszám, félszobaszám | |
-| emelet / összes emelet | |
-| építés éve | |
-| állapot | új, felújított, jó, közepes, felújítandó stb. |
-| fűtéstípus, komfortfokozat | |
-| erkély, lift, parkoló, kert | bool jellegű mezők |
-| kerület / település | |
-| cím / földrajzi koordináta | ha elérhető a hirdetésben |
-| hirdetés típusa | új építésű / használt |
-| hirdetés URL | visszakereshetőség miatt |
-| gyűjtés dátuma | időbeli torzítás dokumentálásához |
+| hirdetés URL | a letöltendő/letöltött oldal címe |
+| állapot | `felfedezve` / `letöltve` / `hiba` / `eltávolítva` |
+| felfedezés dátuma | mikor került be a nyilvántartásba (lista oldal bejárásakor) |
+| letöltés dátuma | mikor történt a tényleges HTML letöltés (ha megtörtént) |
+| nyers HTML fájl elérési útja | hova mentettük a letöltött HTML-t |
+| HTTP státuszkód | a letöltési kísérlet eredménye |
+| retry szám | hányszor próbáltuk újra sikertelen letöltés esetén |
+| utoljára látva (lista oldalon) | később jelzi, ha egy hirdetés eltűnt (eladva/törölve) |
 
-A pontos mezőkészlet a tényleges HTML-struktúra megismerése után finomodik —
-lehet, hogy egyes mezők nem minden hirdetésnél elérhetők.
+A pontos mezőkészlet a tényleges HTML-struktúra megismerése után finomodik.
+
+### 4.1 Export/import zip-ben (csapatmunka, adatcsere)
+
+A `data/<forrás>/` mappa (nyilvántartás CSV + letöltött HTML-ek, lásd 6.
+pont) nem kerül verziókezelésbe (nagy méretű nyers adat, lásd 6. pont), így
+a csapattagok közötti megosztáshoz és a géphatár-független mentéshez
+szükséges egy explicit export/import mechanizmus:
+
+- **Export:** egy adott forrás teljes mappáját (nyilvántartás CSV + az
+  összes letöltött HTML fájl) egyetlen `.zip` fájlba tömöríti. Az export
+  nem módosítja a forrás mappáját, csak egy pillanatkép-másolatot készít
+  belőle.
+- **Import:** egy korábban exportált `.zip` fájlt fogad, és a benne lévő
+  nyilvántartást + HTML-eket **összefésüli** a cél forrás mappájának
+  meglévő állapotával (nem felülírja, nem duplikálja):
+  - **HTML fájlok:** amelyik hirdetés-ID-hoz még nincs letöltött HTML a
+    cél mappában, azt egyszerűen átmásolja; amelyikhez már van, azt
+    érintetlenül hagyja (a már meglévő HTML-t nem írja felül, mert a
+    letöltés időpontjától függetlenül ugyanazt a tartalmat várjuk).
+  - **Nyilvántartás CSV:** soronkénti összefésülés `(forrás, hirdetés ID)`
+    kulcs alapján. Ha egy kulcs csak az egyik oldalon létezik, átvétel
+    változatlanul. Ha mindkét oldalon létezik, a "teljesebb" állapotú sor
+    nyer: `letöltve` > `hiba` > `felfedezve`; azonos állapot esetén a
+    későbbi (nagyobb) dátummal rendelkező sor marad meg.
+  - Az importálás így akkor is biztonságosan megismételhető, ha ugyanazt
+    a zipet kétszer importáljuk, vagy ha két csapattag részben
+    átfedő adatot gyűjtött.
+- Ez a mechanizmus csak a scraper adatára (link-nyilvántartás + nyers
+  HTML) vonatkozik — a `preprocessing` és a modellezési fázis kimenete
+  nem ezen keresztül, hanem a normál git workflow-n (kis méretű CSV-k)
+  keresztül kerül megosztásra.
 
 ## 5. Várható problémák és megoldási lehetőségek
 
@@ -146,11 +202,10 @@ lehet, hogy egyes mezők nem minden hirdetésnél elérhetők.
   mentése, hogy ne kelljen újra letölteni a hibás parse javításához.
 
 ### 5.3 Hiányos / inkonzisztens adatok
-- **Probléma:** nem minden hirdető tölt ki minden mezőt; mezők formátuma
-  (pl. "65 m²" vs "65m2") eltérhet.
-- **Lehetőségek:** toleráns parse-olás (regex, egységesített mértékegység-
-  kezelés), hiányzó mezők explicit `NaN`-ként jelölése (ne 0 vagy üres string),
-  séma-validáció minden rekordnál mentés előtt.
+- Ez a scraper szintjén nem releváns probléma, mert a scraper nem nyeri ki a
+  hirdetés mezőit (ár, méret stb.) — csak a nyers HTML-t tölti le és
+  tárolja. A mezők formátumának eltérése, hiányzó értékek kezelése a
+  `preprocessing` fázis feladata, lásd `preprocessing/plan.md` 4. pont.
 
 ### 5.4 Duplikált / frissülő hirdetések
 - **Probléma:** ugyanazon ingatlan többször is meghirdethető, vagy egy
@@ -173,19 +228,21 @@ lehet, hogy egyes mezők nem minden hirdetésnél elérhetők.
   (pl. naponta egy adag) a politeness és a megszakítás-tolerancia miatt.
 
 ### 5.7 Több forrás összehangolása
-- **Probléma:** különböző honlapok eltérő mezőneveket, mértékegységeket,
-  kategóriaértékeket (pl. "állapot" lehetséges értékei) használnak; ugyanaz az
-  ingatlan több oldalon is meghirdethető (cross-source duplikáció); minden
-  új adapter karbantartási terhet jelent (site-redesign esetén azt is
-  javítani kell).
-- **Lehetőségek:** szigorú, közös séma és adapter-interfész kikényszerítése
-  (3.1 pont), hogy az eltérések az adapter rétegben maradjanak; a `forrás`
-  mező megtartása minden rekordnál, hogy forrásonként is lehessen vizsgálni
-  az adatot; cross-source duplikáció kezelése külön, később (EDA fázisban)
-  cím+méret+szobaszám alapú közelítő egyezés-kereséssel, nem a scraper
-  részeként; **induláskor egy forrás (ingatlan.com) is elég** — csak akkor
-  érdemes második adaptert írni, ha a mennyiség/lefedettség ezt indokolja,
-  hogy a karbantartási teher arányban álljon a haszonnal.
+- **Probléma:** ugyanaz az ingatlan több oldalon is meghirdethető
+  (cross-source duplikáció — ezt linkszinten nem lehet biztosan felismerni,
+  csak a tartalom alapján); minden új adapter karbantartási terhet jelent
+  (site-redesign esetén azt is javítani kell). Az eltérő mezőnevek,
+  mértékegységek és kategóriaértékek kezelése **nem** a scraper, hanem a
+  `preprocessing` fázis problémája (lásd `preprocessing/plan.md` 4.4 pont),
+  mert a scraper nem nyeri ki ezeket a mezőket.
+- **Lehetőségek:** szigorú adapter-interfész kikényszerítése (3.1 pont),
+  hogy az eltérések az adapter rétegben maradjanak; a `forrás` mező
+  megtartása minden nyilvántartott linknél, hogy forrásonként is lehessen
+  vizsgálni az adatot; cross-source duplikáció kezelése külön, később az
+  EDA/preprocessing fázisban, nem a scraper részeként; **induláskor egy
+  forrás (ingatlan.com) is elég** — csak akkor érdemes második adaptert
+  írni, ha a mennyiség/lefedettség ezt indokolja, hogy a karbantartási teher
+  arányban álljon a haszonnal.
 
 ### 5.8 Időbeli torzítás
 - **Probléma:** a gyűjtés időpontja befolyásolja az árakat (piaci mozgás).
@@ -201,26 +258,33 @@ scraper/
   requirements.txt          <- requests/httpx, beautifulsoup4, (playwright, ha kell)
   core/
     config.py                <- globális + forrásonkénti beállítások (delay, rate limit)
-    fetch.py                  <- HTTP lekérés, retry/backoff, nyers válasz mentése
-    schema.py                  <- közös, forrásfüggetlen rekord-séma + validáció
-    dedup.py                    <- (forrás, ID) alapú deduplikáció
-    pipeline.py                  <- adapter-füttetlen vezérlés: adapter kiválasztása,
-                                     futtatása, mentés, futás-riport
+    fetch.py                  <- HTTP lekérés, retry/backoff, nyers HTML mentése
+    registry.py                 <- link-nyilvántartás séma, dedup, állapotkezelés (4. pont)
+    scheduler.py                  <- letöltés-ütemezés: mely linkeket töltsük le/mikor
+    archive.py                      <- zip export/import + összefésülés (4.1 pont)
+    pipeline.py                       <- adapter-független vezérlés: adapter kiválasztása,
+                                         futtatása, futás-riport
   sites/
     base.py                   <- adapter interfész (absztrakt osztály/protokoll):
-                                  list_listing_urls(), parse_listing()
+                                  list_listing_urls()
     ingatlan_com.py             <- első adapter: ingatlan.com-specifikus logika
     # további_forras.py         <- csak akkor, ha egy új forrás bevonása indokolt
   data/
-    raw/
-      ingatlan_com/              <- nyers HTML forrásonként külön mappában
-    processed/
-      listings.csv/parquet        <- végleges, összesített, normalizált adatkészlet
+    ingatlan_com/               <- forrásonként egy mappa (séparálva a többi forrástól)
+      registry.csv                 <- az adott forrás link-nyilvántartása (4. pont sémája)
+      html/
+        <hirdetés_id>.html           <- az adott forráshoz letöltött nyers HTML fájlok
+    # további_forras/            <- csak akkor, ha egy új forrás bevonása indokolt
+  exports/
+    ingatlan_com_2026-10-27.zip   <- export (4.1 pont) kimenete; import ugyanilyen zipet vár
 ```
 
-A `data/raw` és a nagy nyers fájlok várhatóan `.gitignore`-ba kerülnek majd,
-csak a feldolgozott, végleges adatkészletet (vagy annak mintáját) tartjuk
-verziókezelésben.
+A `data/` (minden forrásmappa: nyilvántartás CSV + HTML-ek) és az
+`exports/` is nagy/sokat változó, ezért `.gitignore`-ba kerülnek —
+verziókezelésben csak a kód és a tervdokumentumok maradnak. A csapaton
+belüli megosztás a 4.1 pontban leírt zip export/import mechanizmuson
+keresztül történik, nem git commiton keresztül. A HTML-ből előálló
+strukturált adat (CSV) a `preprocessing/data/` alatt jön létre, nem itt.
 
 ## 7. Következő lépések
 
@@ -231,11 +295,16 @@ verziókezelésben.
    beszerzése.
 3. Kísérleti futás: 1-2 lista oldal + néhány hirdetés oldal manuális
    megvizsgálása (statikus vs. JS-renderelt tartalom eldöntése).
-4. **Első adapter (ingatlan.com) megírása** az interfész implementálásával,
-   kis mintán (pl. 50-100 hirdetés) validálva.
-5. Séma és parser finomítása a prototípus tapasztalatai alapján.
-6. Teljes, ütemezett/korlátozott gyűjtés elindítása Budapestre, eladó
-   lakásokra, egyetlen forrásból.
-7. **Csak ha indokolt** (mennyiség/lefedettség hiánya): további forrás(ok)
+4. **Első adapter (ingatlan.com) megírása** — csak a `list_listing_urls`
+   implementálása —, kis mintán (pl. 50-100 link) validálva.
+5. Nyilvántartás-séma és ütemező finomítása a prototípus tapasztalatai
+   alapján.
+6. `archive.py` (export/import, 4.1 pont) megírása és tesztelése: export egy
+   kis mintából, majd import egy másik (üres vagy részben feltöltött)
+   mappába, ellenőrizve az összefésülés helyességét.
+7. Teljes, ütemezett/korlátozott gyűjtés elindítása Budapestre, eladó
+   lakásokra, egyetlen forrásból: linkek regisztrálása és a hirdetés-oldalak
+   HTML-jének letöltése.
+8. **Csak ha indokolt** (mennyiség/lefedettség hiánya): további forrás(ok)
    felmérése és új adapter írása a meglévő interfészre, az 5.7 pontban
    leírt szempontok figyelembevételével.
