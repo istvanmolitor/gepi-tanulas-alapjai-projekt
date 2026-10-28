@@ -2,28 +2,54 @@
 
 Ez a dokumentum a `plan.md` 4. pontjában ("Előfeldolgozás terv") vázolt lépések
 technikai kidolgozása, és a `scraper/plan.md`-hez kapcsolódik: a scraper
-feladata a nyers HTML letöltése és tárolása (`scraper/data/<forrás>/html/`), a
+feladata a nyers HTML letöltése és tárolása, **típus szerint külön
+mappában** — lista/kereső oldalak (`scraper/data/<forrás>/html/list/`) és
+részletes hirdetés-oldalak (`scraper/data/<forrás>/html/detail/`) —, a
 preprocessing feladata ebből a HTML-ből kinyerni, megtisztítani és egységes
 sémára hozni az adatot, majd CSV-be menteni. A két lépés szándékosan külön
 van választva: ha egy parser hibás vagy a séma változik, nem kell újra
 scrape-elni, elég a meglévő nyers HTML-en újrafuttatni a feldolgozást.
 
+**Lista vs. részletes HTML — más-más kinyert adat:** mivel a két oldaltípus
+tartalma eltérő, a preprocessing is **külön parser-logikával** nyeri ki
+belőlük az adatot (lásd 3.1 pont):
+- a **részletes** oldal HTML-je adja a modellezéshez szükséges teljes
+  mezőkészletet (2. pont táblázata: ár, alapterület, szobaszám, állapot
+  stb.) — ez a fő, kötelező bemenet;
+- a **lista** oldal HTML-je csak előnézeti/kiegészítő adatot ad (pl.
+  hirdetés ID, URL, előnézeti ár, kiemelt hirdetés jelzése, a hirdetés
+  pozíciója a találati listában) — ez önmagában nem elegendő a
+  modellezéshez, de felhasználható a részletes oldalból esetleg hiányzó
+  mezők pótlására, illetve a scraper-szintű nyilvántartás
+  visszaellenőrzésére (pl. hogy egy hirdetés még szerepel-e a találati
+  listában).
+
 A preprocessing maga is **két alfázisra** bomlik (lásd 3. pont):
 1. **Forrásonkénti kinyerés:** a scraperhez hasonlóan itt is forrásonkénti
    **adapter modulok** felelnek a HTML-ből a mezők kinyeréséért — minden
    forrásnak megvan a saját parsere, mert minden honlap HTML-struktúrája
-   más. Minden adapter a saját forrásának eredményét egy **önálló,
-   forrásonkénti CSV-be** menti (pl. `ingatlan_com.csv`).
-2. **Összevonás:** egy külön, forrásfüggetlen lépés a forrásonkénti CSV-ket
-   egyesíti egyetlen, közös, modellezésre előkészített adatkészletbe.
+   más, és ezen belül a lista és a részletes HTML-nek is külön parser
+   függvénye van (más mezőket nyernek ki, lásd fent). Minden adapter a
+   saját forrásának eredményét **önálló, forrásonkénti CSV-kbe** menti
+   (pl. `ingatlan_com.csv` a részletes, `ingatlan_com_list.csv` a lista
+   oldalakból kinyert adatnak).
+2. **Összevonás:** egy külön, forrásfüggetlen lépés a forrásonkénti
+   (részletes) CSV-ket egyesíti egyetlen, közös, modellezésre előkészített
+   adatkészletbe; a lista-oldal CSV-k ehhez csak kiegészítő/ellenőrző
+   szerepben, opcionálisan kapcsolódnak be (lásd 3.2 pont).
 
 ## 1. Cél és hatókör
 
-- **Bemenet:** nyers hirdetés-HTML fájlok, forrásonkénti mappákban
-  (`scraper/data/ingatlan_com/html/<hirdetés_id>.html`, stb.).
-- **Köztes kimenet:** forrásonkénti CSV-k, mindegyik az adott forrásból
-  kinyert adatot tartalmazza, közös oszlopsémával
-  (`preprocessing/data/processed/sources/ingatlan_com.csv`, stb.).
+- **Bemenet:** nyers HTML fájlok, forrásonként és **típusonként külön**
+  mappákban — részletes hirdetés-oldalak
+  (`scraper/data/ingatlan_com/html/detail/<hirdetés_id>.html`, stb.) és
+  lista/kereső oldalak (`scraper/data/ingatlan_com/html/list/<...>.html`,
+  stb.).
+- **Köztes kimenet:** forrásonkénti CSV-k, mindegyik az adott forrásból és
+  oldaltípusból kinyert adatot tartalmazza, oldaltípusonként külön
+  oszlopsémával (`preprocessing/data/processed/sources/ingatlan_com.csv`
+  a részletes, `preprocessing/data/processed/sources/ingatlan_com_list.csv`
+  a lista oldalakból kinyert adatnak, stb.).
 - **Végső kimenet:** a forrásonkénti CSV-k összevonásából létrejövő,
   egyesített, tisztított adatkészlet
   (`preprocessing/data/processed/listings.csv`), ami már modellezésre kész
@@ -61,14 +87,16 @@ elérhetővé.
 
 ## 3. Feldolgozási folyamat (HTML → forrásonkénti CSV → egyesített CSV)
 
-### 3.1 Forrásonkénti kinyerés (adapterek — egy forrás, egy CSV)
+### 3.1 Forrásonkénti kinyerés (adapterek — egy forrás, két HTML-típus, két CSV)
 
 Minden bevont forráshoz egy adapter modul tartozik (`parsers/<forrás>.py`),
-ami a következő, közös interfészt implementálja:
+ami **oldaltípusonként külön** parser-függvényt implementál, mert a lista
+és a részletes HTML más mezőket tartalmaz (lásd a dokumentum elején).
 
-1. **Beolvasás:** az adott forrás `scraper/data/<forrás>/html/` mappájának
-   HTML fájljainak
-   bejárása.
+**a) Részletes (detail) oldalak — a fő, kötelező bemenet:**
+
+1. **Beolvasás:** az adott forrás `scraper/data/<forrás>/html/detail/`
+   mappájának HTML fájljainak bejárása.
 2. **Parse-olás:** forrásspecifikus HTML-parser (pl. BeautifulSoup
    selectorok) kinyeri a nyers mezőértékeket a HTML-ből (szöveg, pl.
    `"65 m²"`, `"3. emelet / 5"`, `"58 900 000 Ft"`), és a 2. pontban
@@ -83,14 +111,32 @@ ami a következő, közös interfészt implementálja:
    ingatlan_com.csv`). Ez a fájl **csak** az adott forrásból kinyert
    adatokat tartalmazza.
 
-Ez a szakasz forrásonként önállóan futtatható és ismételhető — ha egy
-forrás parserét kell javítani, csak az ő CSV-je újragenerálódik, a többi
-forrásé nem sérül.
+**b) Lista (list) oldalak — kiegészítő, opcionális bemenet:**
+
+1. **Beolvasás:** az adott forrás `scraper/data/<forrás>/html/list/`
+   mappájának HTML fájljainak bejárása.
+2. **Parse-olás:** a lista oldal HTML-jéből a rajta szereplő hirdetés-
+   előnézetek kinyerése (hirdetés ID, URL, előnézeti ár, kiemelt jelzés,
+   pozíció a listában stb.) — jóval szűkebb mezőkészlet, mint a részletes
+   oldalaknál, és nincs rá kötelező mező-elvárás (2. pont nem vonatkozik
+   rá).
+3. **Mentés:** az adott forrás lista oldalaiból kinyert rekordok egy
+   **önálló CSV-be** kerülnek (pl. `data/processed/sources/
+   ingatlan_com_list.csv`).
+
+Ez a szakasz forrásonként és oldaltípusonként is önállóan futtatható és
+ismételhető — ha egy forrás (vagy oldaltípus) parserét kell javítani, csak
+az ő CSV-je újragenerálódik, a többi nem sérül.
 
 ### 3.2 Összevonás (forrásfüggetlen — a közös adatkészlet előállítása)
 
-1. **Beolvasás:** az összes forrásonkénti CSV (`data/processed/sources/
-   *.csv`) betöltése.
+A végső `listings.csv` a **részletes (detail)** CSV-kből épül fel — a
+lista-oldal CSV-k nem lépnek be közvetlenül ebbe a táblába, csak opcionális
+kiegészítésre/ellenőrzésre használhatók (lásd 4. lépés).
+
+1. **Beolvasás:** az összes forrásonkénti, **részletes** CSV
+   (`data/processed/sources/<forrás>.csv`, a `*_list.csv` fájlok
+   kivételével) betöltése.
 2. **Egyesítés:** a közös séma szerint egyetlen táblába fűzése (mivel a
    séma már az adapterek szintjén egységesített, ez technikailag egyszerű
    konkatenáció).
@@ -99,10 +145,15 @@ forrásé nem sérül.
    duplikáció (ugyanaz az ingatlan két különböző honlapon) külön, később,
    EDA-szintű, közelítő egyezés-kereséssel kezelhető — nem ennek a lépésnek
    a feladata.
-4. **Kiugró érték szűrés** a teljes, egyesített adatkészleten (4.2 pont),
+4. **Kiegészítés lista-oldal adattal (opcionális):** ha egy hirdetéshez
+   hiányzik egy mező a részletes CSV-ből, de szerepel a megfelelő
+   `<forrás>_list.csv`-ben (`(forrás, hirdetés ID)` kulcs alapján
+   összekapcsolva), az a hiány pótolható belőle; a lista-oldal adat sosem
+   írja felül a részletes oldalból már meglévő értéket.
+5. **Kiugró érték szűrés** a teljes, egyesített adatkészleten (4.2 pont),
    mert az outlier-küszöbök forrásonként eltérő eloszlást takarhatnak, és
    összevontan értelmesebb eldönteni őket.
-5. **Mentés:** a végleges, egyesített, modellezésre előkészített adatkészlet
+6. **Mentés:** a végleges, egyesített, modellezésre előkészített adatkészlet
    `data/processed/listings.csv`-be kerül.
 
 Ez a szakasz forrásfüggetlen, közös kód — nem tud semmit az egyes honlapok
@@ -149,10 +200,15 @@ HTML-struktúrájáról, csak a forrásonkénti CSV-k közös sémáját haszná
 
 ## 5. CSV sémák
 
-- **Forrásonkénti CSV** (`data/processed/sources/<forrás>.csv`): a 2.
-  pontban felsorolt közös séma szerint, de csak az adott forrás rekordjaival.
-  Minden adapternek ide kell leképeznie a saját mezőit.
-- **Egyesített CSV** (`data/processed/listings.csv`): ugyanaz a séma, az
+- **Forrásonkénti, részletes CSV** (`data/processed/sources/<forrás>.csv`):
+  a 2. pontban felsorolt közös séma szerint, de csak az adott forrás
+  részletes oldalaiból kinyert rekordjaival. Minden adapternek ide kell
+  leképeznie a saját mezőit.
+- **Forrásonkénti, lista-oldal CSV** (`data/processed/sources/
+  <forrás>_list.csv`): saját, szűkebb séma (hirdetés ID, URL, előnézeti
+  ár, kiemelt jelzés, pozíció a listában stb.) — nem a 2. pont sémáját
+  követi, csak kiegészítő/ellenőrző szerepe van (3.2 szakasz 4. lépés).
+- **Egyesített CSV** (`data/processed/listings.csv`): a 2. pont sémája, az
   összes forrásonkénti CSV összefűzve, deduplikálva és outlier-szűrve (3.2
   szakasz), kiegészítve a tisztítás során származtatott mezőkkel (pl.
   `négyzetméterár` = ár / alapterület, ha mindkettő elérhető). Ez a fájl a
@@ -170,15 +226,20 @@ preprocessing/
   requirements.txt           <- pandas, beautifulsoup4
   schema.py                   <- a közös séma + validációs szabályok
   parsers/
-    base.py                    <- adapter interfész: extract(raw_dir) -> DataFrame/CSV
+    base.py                    <- adapter interfész: extract_detail(raw_dir),
+                                  extract_list(raw_dir) -> DataFrame/CSV
     common.py                    <- megosztott normalizáló függvények (4.1, 4.4)
-    ingatlan_com.py                 <- ingatlan.com adapter: HTML -> sources/ingatlan_com.csv
+    ingatlan_com.py                 <- ingatlan.com adapter: detail HTML ->
+                                       sources/ingatlan_com.csv, list HTML ->
+                                       sources/ingatlan_com_list.csv
     # további_forras.py             <- csak akkor, ha a scraper is bővül új forrással
-  merge.py                    <- összevonás: sources/*.csv -> listings.csv (3.2 szakasz)
+  merge.py                    <- összevonás: sources/<forrás>.csv (+ opcionálisan
+                                  sources/<forrás>_list.csv) -> listings.csv (3.2 szakasz)
   data/
     processed/
       sources/
-        ingatlan_com.csv            <- forrásonkénti, kinyert adat
+        ingatlan_com.csv            <- forrásonkénti, részletes oldalból kinyert adat
+        ingatlan_com_list.csv         <- forrásonkénti, lista oldalból kinyert adat
       listings.csv                    <- végleges, egyesített, modellezésre kész adatkészlet
 ```
 
@@ -189,8 +250,10 @@ preprocessing/
 2. Egy minta HTML alapján a tényleges mezőnevek/CSS-selectorok felmérése,
    a 2. pontban felsorolt mezők elérhetőségének ellenőrzése.
 3. `schema.py`, `parsers/common.py` és az első adapter
-   (`parsers/ingatlan_com.py`) megírása a kis mintán, ellenőrizve, hogy
-   helyesen generálja a `sources/ingatlan_com.csv`-t.
+   (`parsers/ingatlan_com.py`) megírása a kis mintán — előbb a részletes
+   oldal parserét (`extract_detail`), ellenőrizve, hogy helyesen generálja
+   a `sources/ingatlan_com.csv`-t, majd (ha van rá idő) a lista oldal
+   parserét (`extract_list`) a `sources/ingatlan_com_list.csv`-hez.
 4. `merge.py` megírása és validálása (kezdetben akár egyetlen forrással is
    működnie kell, hogy a végső `listings.csv` előálljon).
 5. Teljes nyers adatkészleten lefuttatva ellenőrizni az eredmény CSV-k
